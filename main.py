@@ -8,7 +8,7 @@ from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 
-APP_VERSION = "responsive-rfp-hiring-surge-v2-simple"
+APP_VERSION = "responsive-rfp-hiring-surge-v2.1-new-accounts"
 MAX_ACCOUNTS = 5
 
 HTML = r"""<!doctype html>
@@ -117,6 +117,14 @@ header{
   display:none;margin-top:10px;border-radius:10px;padding:9px 10px;
   background:#fff1f2;border:1px solid #ecc8cc;color:#963f49;
   font-size:8.7px;line-height:1.45
+}
+.history-row{
+  display:flex;justify-content:space-between;gap:12px;align-items:center;
+  margin-top:9px;color:#88928b;font-size:7.8px
+}
+.history-row button{
+  border:0;background:transparent;color:var(--blue);padding:0;
+  font-size:7.8px;font-weight:850
 }
 
 /* results */
@@ -287,6 +295,10 @@ footer{
     <button class="run" id="runBtn">Find accounts</button>
   </div>
   <div class="warning" id="warning"></div>
+  <div class="history-row">
+    <span id="historyInfo">New-account mode on.</span>
+    <button id="resetHistory" type="button">Reset history</button>
+  </div>
 </section>
 
 <section class="results-wrap">
@@ -348,6 +360,46 @@ footer{
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let currentAccounts=[];
+const HISTORY_PREFIX='responsive_rfp_seen_v1';
+
+function historyKey(){
+  return HISTORY_PREFIX+':'+$('market').value+'|'+$('companyType').value;
+}
+
+function getSeenCompanies(){
+  try{
+    const value=JSON.parse(localStorage.getItem(historyKey())||'[]');
+    return Array.isArray(value)?value.slice(-100):[];
+  }catch(e){
+    return [];
+  }
+}
+
+function saveSeenCompanies(names){
+  const cleaned=[];
+  const used=new Set();
+  (names||[]).forEach(name=>{
+    const display=String(name||'').trim();
+    const key=display.toLowerCase();
+    if(display && !used.has(key)){
+      used.add(key);
+      cleaned.push(display);
+    }
+  });
+  localStorage.setItem(historyKey(),JSON.stringify(cleaned.slice(-100)));
+}
+
+function addSeenCompanies(accounts){
+  const prior=getSeenCompanies();
+  saveSeenCompanies(prior.concat((accounts||[]).map(a=>a.company)));
+}
+
+function updateHistoryInfo(){
+  const count=getSeenCompanies().length;
+  $('historyInfo').textContent=count
+    ? count+' previously surfaced account'+(count===1?'':'s')+' will be skipped.'
+    : 'New-account mode on.';
+}
 
 function renderAccounts(){
   if(!currentAccounts.length){
@@ -406,7 +458,8 @@ async function runPlay(){
       body:JSON.stringify({
         market:$('market').value,
         company_type:$('companyType').value,
-        signal_window:Number($('window').value)
+        signal_window:Number($('window').value),
+        exclude_companies:getSeenCompanies()
       })
     });
 
@@ -414,6 +467,8 @@ async function runPlay(){
     if(!res.ok)throw new Error(data.error||'Research failed');
 
     currentAccounts=data.accounts||[];
+    addSeenCompanies(currentAccounts);
+    updateHistoryInfo();
     $('outreach').classList.remove('active');
     renderAccounts();
   }catch(e){
@@ -426,6 +481,13 @@ async function runPlay(){
 }
 
 $('runBtn').addEventListener('click',runPlay);
+$('resetHistory').addEventListener('click',()=>{
+  localStorage.removeItem(historyKey());
+  updateHistoryInfo();
+});
+$('market').addEventListener('change',updateHistoryInfo);
+$('companyType').addEventListener('change',updateHistoryInfo);
+updateHistoryInfo();
 
 $('copyBtn').addEventListener('click',async()=>{
   const text=$('subject').textContent+'\n\n'+$('email').textContent;
@@ -454,10 +516,10 @@ def json_post(url, headers, payload, timeout=60):
         raise RuntimeError(f"{exc.code}: {body[:450]}")
 
 
-def tavily_search(query, time_range=None):
+def tavily_search(query, time_range=None, search_depth="basic"):
     payload = {
         "query": query,
-        "search_depth": "basic",
+        "search_depth": search_depth,
         "topic": "general",
         "max_results": 8,
         "include_answer": False,
@@ -499,20 +561,51 @@ def time_range_for_window(days):
     return "year"
 
 
-def build_queries(market, company_type):
-    return [
-        f'{company_type} {market} hiring "proposal manager" OR "proposal specialist" OR "proposal writer"',
-        f'{company_type} {market} hiring "RFP manager" OR "RFP specialist" OR "RFP writer"',
-        f'{company_type} {market} hiring "bid manager" OR "response manager" OR "proposal operations"',
-    ]
+def _clean_exclusions(excluded_companies):
+    cleaned = []
+    used = set()
+    for name in excluded_companies or []:
+        name = str(name).replace('"', "").strip()[:120]
+        key = name.lower()
+        if name and key not in used:
+            used.add(key)
+            cleaned.append(name)
+    return cleaned[:100]
 
 
-def research_hiring(market, company_type, signal_window):
+def build_queries(market, company_type, excluded_companies=None, discovery_pass=1):
+    excluded = _clean_exclusions(excluded_companies)
+    # Put a handful of already-seen company names directly into the search query
+    # so Tavily is encouraged to explore different result clusters.
+    negatives = " ".join(f'-"{name}"' for name in excluded[-10:])
+
+    if discovery_pass == 1:
+        queries = [
+            f'{company_type} {market} careers hiring "proposal manager" OR "proposal specialist" OR "proposal writer"',
+            f'{company_type} {market} careers hiring "RFP manager" OR "RFP specialist" OR "RFP writer"',
+            f'{company_type} {market} jobs "bid manager" OR "response manager" OR "proposal operations"',
+            f'{company_type} {market} careers "proposal development" OR "strategic proposals" OR "proposal operations"',
+        ]
+    else:
+        # Broader fallback vocabulary for a second pass when the first pass is
+        # dominated by accounts we have already shown.
+        queries = [
+            f'{company_type} {market} careers "proposal lead" OR "proposal director" OR "proposal coordinator"',
+            f'{company_type} {market} jobs "capture manager" proposals RFP',
+            f'{company_type} {market} careers "RFP response" OR "bid management" OR "proposal development"',
+            f'{company_type} {market} hiring enterprise proposals questionnaires responses',
+        ]
+
+    return [(query + " " + negatives).strip() for query in queries]
+
+
+def research_hiring(market, company_type, signal_window, excluded_companies=None, discovery_pass=1):
     raw = []
     time_range = time_range_for_window(signal_window)
+    depth = "advanced" if discovery_pass == 2 else "basic"
 
-    for query in build_queries(market, company_type):
-        raw.extend(tavily_search(query, time_range))
+    for query in build_queries(market, company_type, excluded_companies, discovery_pass):
+        raw.extend(tavily_search(query, time_range, search_depth=depth))
 
     seen = set()
     unique = []
@@ -528,7 +621,7 @@ def research_hiring(market, company_type, signal_window):
             "snippet": (item.get("content") or "")[:1800],
         })
 
-    return unique[:28]
+    return unique[:32]
 
 
 def response_schema():
@@ -566,7 +659,7 @@ def response_schema():
     }
 
 
-def analyze_hiring(market, company_type, signal_window, evidence):
+def analyze_hiring(market, company_type, signal_window, evidence, excluded_companies=None):
     evidence_rows = [
         {
             "id": i + 1,
@@ -576,6 +669,9 @@ def analyze_hiring(market, company_type, signal_window, evidence):
         }
         for i, x in enumerate(evidence)
     ]
+
+    excluded = _clean_exclusions(excluded_companies)
+    excluded_block = json.dumps(excluded, indent=2)
 
     prompt = f"""
 You are building one account-based GTM play for Responsive.
@@ -594,6 +690,9 @@ Requested signal window: approximately last {signal_window} days
 GOAL
 Find companies showing a credible, current hiring signal around proposal, RFP, bid, or response-management work.
 
+ALREADY SURFACED — DO NOT RETURN THESE COMPANIES
+{excluded_block}
+
 RULES
 - Use only real operating companies supported by the supplied evidence.
 - Exclude job boards, staffing agencies, recruiters, consultants, universities, generic articles, and irrelevant vendors.
@@ -604,6 +703,7 @@ RULES
 - Do not invent RFP volume, headcount, response time, revenue, pipeline, or internal pain.
 - source_url must exactly match one supplied candidate URL.
 - Dedupe companies.
+- Never return a company listed in ALREADY SURFACED, even if it appears in the evidence again.
 - Omit weak evidence.
 - Only return accounts scoring 75 or above.
 - Return at most {MAX_ACCOUNTS} accounts.
@@ -665,10 +765,13 @@ EVIDENCE
 
     parsed = json.loads(extract_output_text(data))
     allowed_urls = {x["url"] for x in evidence}
+    excluded_keys = {name.lower() for name in excluded}
 
     accounts = []
     for account in parsed.get("accounts", []):
         if account.get("source_url") not in allowed_urls:
+            continue
+        if str(account.get("company", "")).strip().lower() in excluded_keys:
             continue
         try:
             score = int(account.get("score", 0))
@@ -711,8 +814,19 @@ def run_play():
 
     signal_window = max(30, min(signal_window, 365))
 
+    raw_exclusions = body.get("exclude_companies", [])
+    if not isinstance(raw_exclusions, list):
+        raw_exclusions = []
+    excluded_companies = _clean_exclusions(raw_exclusions)
+
     try:
-        evidence = research_hiring(market, company_type, signal_window)
+        evidence = research_hiring(
+            market,
+            company_type,
+            signal_window,
+            excluded_companies=excluded_companies,
+            discovery_pass=1,
+        )
         if not evidence:
             return jsonify({
                 "error": "No usable hiring evidence was returned. Try a broader company type or longer signal window."
